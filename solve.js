@@ -42,17 +42,20 @@ function slugifyRaw(text) {
   const plain = NON_ASCII.test(text) ? text.normalize('NFKD').replace(MARKS, '') : text;
   let out = '';
   let gap = false;
-  for (const ch of plain) {
-    let keep = null;
-    if (ch >= 'A' && ch <= 'Z') keep = ch.toLowerCase();
-    else if ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) keep = ch;
-    if (keep === null) {
+  // An index loop over code units: a non-BMP character is two surrogates, both "other" here, and the boolean
+  // gap makes the pair count once, exactly as one code point did.
+  for (let i = 0; i < plain.length; i++) {
+    const c = plain.charCodeAt(i);
+    let keep = -1;
+    if (c >= 65 && c <= 90) keep = c + 32;
+    else if ((c >= 97 && c <= 122) || (c >= 48 && c <= 57)) keep = c;
+    if (keep === -1) {
       gap = out.length > 0;
       continue;
     }
     if (gap) out += '-';
     gap = false;
-    out += keep;
+    out += String.fromCharCode(keep);
   }
   out = out.slice(0, SLUG_MAX).replace(/-+$/, '');
   return out === '' ? 'untitled' : out;
@@ -87,9 +90,9 @@ export function longDate(date) {
 
 /** Whether a code unit is whitespace to JavaScript's \s. */
 function isWsCode(c) {
+  if (c === 32 || (c >= 9 && c <= 13)) return true;
+  if (c < 0xa0) return false; // no whitespace between \r and \xa0
   return (
-    c === 32 ||
-    (c >= 9 && c <= 13) ||
     c === 0xa0 ||
     c === 0x1680 ||
     (c >= 0x2000 && c <= 0x200a) ||
@@ -196,22 +199,30 @@ const FM_BLANK = /^[ \t]*$/;
  * by offset rather than re-joined.
  */
 export function parseFrontMatter(text) {
-  const lines = text.split('\n');
-  if (lines[0] !== '---') return { error: 'no front matter' };
-  let close = -1;
-  for (let i = 1; i < lines.length; i++) {
-    if (lines[i] === '---') {
-      close = i;
+  // The first line must be exactly "---": the text is "---" or opens "---\n".
+  if (!text.startsWith('---') || (text.length > 3 && text.charCodeAt(3) !== 10)) return { error: 'no front matter' };
+  // The closing line is the first later line that is exactly "---"; find it by offset, without splitting the body.
+  let closeStart = -1;
+  let closeEnd = -1;
+  for (let pos = 4; pos <= text.length; ) {
+    let end = text.indexOf('\n', pos);
+    if (end === -1) end = text.length;
+    if (end - pos === 3 && text.startsWith('---', pos)) {
+      closeStart = pos;
+      closeEnd = end;
       break;
     }
+    if (end === text.length) break;
+    pos = end + 1;
   }
-  if (close === -1) return { error: 'the front matter is not closed' };
+  if (closeStart === -1) return { error: 'the front matter is not closed' };
+  const head = closeStart === 4 ? [] : text.slice(4, closeStart - 1).split('\n');
   const data = {};
-  for (let i = 1; i < close; i++) {
-    const line = lines[i];
+  for (let j = 0; j < head.length; j++) {
+    const line = head[j];
     if (FM_BLANK.test(line) || line.startsWith('#')) continue;
     const m = FM_LINE.exec(line);
-    if (!m) return { error: `line ${i + 1} is not "key: value"` };
+    if (!m) return { error: `line ${j + 2} is not "key: value"` };
     const key = m[1];
     const raw = (m[2] ?? '').replace(/[ \t]+$/, '');
     if (!FM_KEYS.includes(key)) return { error: `unknown key "${key}"` };
@@ -222,9 +233,7 @@ export function parseFrontMatter(text) {
     data[key] = v.value;
   }
   if (!Object.hasOwn(data, 'title')) return { error: 'no title' };
-  let bodyStart = 0;
-  for (let i = 0; i <= close; i++) bodyStart += lines[i].length + 1;
-  return { data, body: text.slice(bodyStart) };
+  return { data, body: text.slice(closeEnd + 1) };
 }
 
 // ---------------------------------------------------------------- markdown
@@ -620,6 +629,137 @@ function tplTruthy(v) {
   return v !== undefined && v !== null && v !== false && v !== '' && v !== 0;
 }
 
+/**
+ * What a node list's rendering depends on: the root names it reads that are not bound inside it (its free
+ * roots), and whether it contains an include (whose rendering also depends on the include depth). Includes
+ * are followed into the named template; a template that transitively includes itself gives null and is
+ * never memoized. Rendering is pure, so two renders of one node whose free roots resolve to the same
+ * values give the same text — the shared fragments of a site (nav, header, footer, a post's card) are
+ * rendered once per build instead of once per page.
+ */
+function freeInfoOf(nodes, ctx, visiting) {
+  const roots = new Set();
+  let inc = false;
+  const walk = (list, bound) => {
+    for (const nd of list) {
+      switch (nd.kind) {
+        case 'var':
+        case 'raw':
+          if (!bound.has(nd.path[0])) roots.add(nd.path[0]);
+          break;
+        case 'if':
+          if (!bound.has(nd.path[0])) roots.add(nd.path[0]);
+          if (!walk(nd.then, bound)) return false;
+          if (nd.else !== null && !walk(nd.else, bound)) return false;
+          break;
+        case 'for': {
+          if (!bound.has(nd.path[0])) roots.add(nd.path[0]);
+          const inner = new Set(bound);
+          inner.add(nd.name);
+          inner.add('loop');
+          if (!walk(nd.body, inner)) return false;
+          break;
+        }
+        case 'include': {
+          inc = true;
+          const sub = templateFreeInfo(nd.name, ctx, visiting);
+          if (sub === null) return false;
+          for (const r of sub.roots) if (!bound.has(r)) roots.add(r);
+          break;
+        }
+      }
+    }
+    return true;
+  };
+  return walk(nodes, new Set()) ? { roots: [...roots], inc } : null;
+}
+
+/** A template's free info, cached on the build's ctx; null when its includes cycle. */
+function templateFreeInfo(name, ctx, visiting) {
+  if (ctx.freeCache.has(name)) return ctx.freeCache.get(name);
+  const nodes = ctx.templates.get(name);
+  if (nodes === undefined) return { roots: [], inc: true }; // a missing template renders nothing, at any scope
+  if (visiting.has(name)) return null;
+  visiting.add(name);
+  const info = freeInfoOf(nodes, ctx, visiting);
+  visiting.delete(name);
+  const out = info === null ? null : { roots: info.roots, inc: true };
+  ctx.freeCache.set(name, out);
+  return out;
+}
+
+/** A node's free info, cached per build; null when it must not be memoized. */
+function nodeFreeInfo(nd, ctx) {
+  let info = ctx.nodeInfo.get(nd);
+  if (info === undefined) {
+    info = freeInfoOf([nd], ctx, new Set());
+    ctx.nodeInfo.set(nd, info);
+  }
+  return info;
+}
+
+/** The memo key of `info` in `scope`: each free root's resolved value, objects by build-local identity. */
+function memoKeyOf(info, scope, ctx, depth) {
+  let key = info.inc ? `@${depth}|` : '';
+  for (const root of info.roots) {
+    const v = tplLookup(scope, [root]);
+    if (v === undefined) key += 'u|';
+    else if (v === null) key += 'n|';
+    else if (typeof v === 'object') {
+      let id = ctx.ids.get(v);
+      if (id === undefined) {
+        id = ctx.nextId++;
+        ctx.ids.set(v, id);
+      }
+      key += `#${id}|`;
+    } else key += `${JSON.stringify(v)}|`;
+  }
+  return key;
+}
+
+/** `renderFn` into `out`, or the memoized text of an earlier identical render of this node in this build. */
+function renderMemoized(nd, info, scope, ctx, depth, out, renderFn) {
+  if (info === null || info.roots.length > 8) {
+    renderFn(out);
+    return;
+  }
+  const key = memoKeyOf(info, scope, ctx, depth);
+  let byNode = ctx.memo.get(nd);
+  if (byNode !== undefined) {
+    const hit = byNode.get(key);
+    if (hit !== undefined) {
+      out.push(hit);
+      return;
+    }
+  }
+  const sub = [];
+  renderFn(sub);
+  const text = sub.join('');
+  if (byNode === undefined) {
+    byNode = new Map();
+    ctx.memo.set(nd, byNode);
+  }
+  byNode.set(key, text);
+  out.push(text);
+}
+
+/** One for node rendered into `out` (its items in fresh child scopes). */
+function renderFor(nd, scope, ctx, depth, out) {
+  const xs = tplLookup(scope, nd.path);
+  if (!Array.isArray(xs)) return;
+  const len = xs.length;
+  for (let k = 0; k < len; k++) {
+    const vars = { [nd.name]: xs[k], loop: { index: k + 1, first: k === 0, last: k === len - 1, length: len } };
+    renderNodes(nd.body, { vars, parent: scope }, ctx, depth, out);
+  }
+}
+
+/** One include node rendered into `out` (nothing past the depth cap, or for a template that did not parse). */
+function renderInclude(nd, scope, ctx, depth, out) {
+  const t = ctx.templates.get(nd.name);
+  if (t !== undefined && depth < INCLUDE_DEPTH) renderNodes(t, scope, ctx, depth + 1, out);
+}
+
 /** `nodes` rendered into the `out` array, in `scope`; `ctx` holds the parsed templates and the HTML escape. */
 function renderNodes(nodes, scope, ctx, depth, out) {
   for (let idx = 0; idx < nodes.length; idx++) {
@@ -640,21 +780,12 @@ function renderNodes(nodes, scope, ctx, depth, out) {
         if (branch !== null) renderNodes(branch, scope, ctx, depth, out);
         break;
       }
-      case 'for': {
-        const xs = tplLookup(scope, nd.path);
-        if (!Array.isArray(xs)) break;
-        const len = xs.length;
-        for (let k = 0; k < len; k++) {
-          const vars = { [nd.name]: xs[k], loop: { index: k + 1, first: k === 0, last: k === len - 1, length: len } };
-          renderNodes(nd.body, { vars, parent: scope }, ctx, depth, out);
-        }
+      case 'for':
+        renderMemoized(nd, nodeFreeInfo(nd, ctx), scope, ctx, depth, out, (o) => renderFor(nd, scope, ctx, depth, o));
         break;
-      }
-      case 'include': {
-        const t = ctx.templates.get(nd.name);
-        if (t !== undefined && depth < INCLUDE_DEPTH) renderNodes(t, scope, ctx, depth + 1, out);
+      case 'include':
+        renderMemoized(nd, templateFreeInfo(nd.name, ctx, new Set()), scope, ctx, depth, out, (o) => renderInclude(nd, scope, ctx, depth, o));
         break;
-      }
     }
   }
 }
@@ -810,6 +941,9 @@ export function build(input) {
   const broken = new Set();
   {
     const staticPaths = new Set(statics.map((f) => f.path));
+    // A (directory, relative path) pair resolves once per build: the pages and static files it can name are
+    // fixed before any body is rendered. The value cached is the URL the pair resolves to, or null (broken).
+    const linkCache = new Map();
     for (const s of kept) {
       const dir = dirOf(s.path);
       const env = {
@@ -818,9 +952,14 @@ export function build(input) {
           const hash = target.indexOf('#');
           const rel = hash === -1 ? target : target.slice(0, hash);
           const frag = hash === -1 ? '' : target.slice(hash);
-          const path = rel === '' ? null : resolvePath(dir, rel);
-          if (path !== null && bySource.has(path)) return `${bySource.get(path).url}${frag}`;
-          if (path !== null && staticPaths.has(path)) return `${base}/${path}${frag}`;
+          const key = `${dir}\0${rel}`;
+          let hit = linkCache.get(key);
+          if (hit === undefined) {
+            const path = rel === '' ? null : resolvePath(dir, rel);
+            hit = path !== null && bySource.has(path) ? bySource.get(path).url : path !== null && staticPaths.has(path) ? `${base}/${path}` : null;
+            linkCache.set(key, hit);
+          }
+          if (hit !== null) return `${hit}${frag}`;
           broken.add(`broken-link ${s.path} -> ${target}`);
           return target;
         },
@@ -860,7 +999,7 @@ export function build(input) {
     const site = { title: input.site.title, base_url: base };
     const allTags = tags.map((t) => ({ name: t.name, slug: t.slug, url: t.url, count: t.posts.length }));
     const recent = posts.slice(0, input.site.recent).map((p) => cardOf(p));
-    const ctx = { templates, escape: escapeHtml };
+    const ctx = { templates, escape: escapeHtml, memo: new Map(), ids: new WeakMap(), nextId: 1, freeCache: new Map(), nodeInfo: new WeakMap() };
     // site, tags and recent sit in one shared base scope under every render's own scope, instead of being
     // spread into a fresh object per page; the chain gives the same lookups (no render binds those names).
     const baseScope = { vars: { site, tags: allTags, recent }, parent: null };
